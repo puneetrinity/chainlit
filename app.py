@@ -132,7 +132,7 @@ async def start():
 
     # Create HR task action buttons
     actions = [
-        cl.Action(name=task_id, value=task_data["prompt"], label=task_data["label"])
+        cl.Action(name=task_id, payload=task_data["prompt"], label=task_data["label"])
         for task_id, task_data in HR_TASKS.items()
     ]
 
@@ -155,27 +155,27 @@ async def settings_update(settings):
 @cl.action_callback("resume_guidance")
 async def on_resume_guidance(action: cl.Action):
     """Handle Resume Guidance action."""
-    await process_hr_task(action.value)
+    await process_hr_task(action.payload)
 
 @cl.action_callback("job_description")
 async def on_job_description(action: cl.Action):
     """Handle Job Description action."""
-    await process_hr_task(action.value)
+    await process_hr_task(action.payload)
 
 @cl.action_callback("ats_keywords")
 async def on_ats_keywords(action: cl.Action):
     """Handle ATS Keywords action."""
-    await process_hr_task(action.value)
+    await process_hr_task(action.payload)
 
 @cl.action_callback("job_resume_match")
 async def on_job_resume_match(action: cl.Action):
     """Handle Job-Resume Match action."""
-    await process_hr_task(action.value)
+    await process_hr_task(action.payload)
 
 @cl.action_callback("recruiting_strategy")
 async def on_recruiting_strategy(action: cl.Action):
     """Handle Recruiting Strategy action."""
-    await process_hr_task(action.value)
+    await process_hr_task(action.payload)
 
 async def process_hr_task(prompt: str):
     """Process HR task with current settings."""
