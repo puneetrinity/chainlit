@@ -243,20 +243,6 @@ async def send_query(prompt: str, sampling: dict, flags: dict):
         await out.stream_token(token + " ")
     await out.update()
 
-    # Append validation/usage info as a side message
-    meta_lines = []
-    if validation:
-        intent = validation.get("intent", "-")
-        valid = validation.get("valid", None)
-        issues = validation.get("issues", [])
-        meta_lines.append(f"**Validation:** intent={intent}, valid={valid}")
-        if issues:
-            meta_lines.append(f"**Issues:** {'; '.join(issues[:4])}")
-    if usage:
-        meta_lines.append(f"**Usage:** input={usage.get('input')} tokens, output={usage.get('output')} tokens")
-    if meta_lines:
-        await cl.Message(content="\n".join(meta_lines)).send()
-
 @cl.on_message
 async def on_message(msg: cl.Message):
     """Handle user messages."""
