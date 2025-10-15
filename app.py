@@ -126,7 +126,14 @@ TEMPLATES = {
         "variants": [
             {
                 "name": "streaming_aware",
-                "hint": "For streaming/real-time roles: emphasize Kafka, event-driven architecture, backpressure handling, reactive systems communities and specific tech meetups."
+                "hint": (
+                    "For Java + streaming-like profiles (even if Kafka/Pulsar not stated): "
+                    "1) Include Boolean sourcing patterns using adjacent signals: 'event-driven', 'real-time', 'message queue', 'JMS', 'ActiveMQ', 'RabbitMQ', 'Kinesis', 'Pulsar', 'Pub/Sub', 'CDC/Debezium', 'Spring Cloud Stream', 'Project Reactor', 'Akka', 'Netty', 'backpressure', 'low-latency', 'throughput'. "
+                    "2) List 4–6 channels with cadence: LinkedIn Recruiter, GitHub code search, Stack Overflow tags, Kafka/Reactive meetups, Java user groups, conference speakers (QCon/Kafka Summit). Include weekly/monthly/quarterly rhythm. "
+                    "3) Outreach: personalize by mapping their event-driven/JMS/Reactive signals to Kafka/Pulsar; add a short sample opener. "
+                    "4) Screening prompts: backpressure/idempotent consumers; batch→near-real-time migration pitfalls. "
+                    "5) Metrics: response rate %, pass-through %, time-to-hire."
+                )
             },
             {
                 "name": "senior_executive",
@@ -515,39 +522,77 @@ def merge_sampling(base_sampling: dict, template_sampling: dict) -> dict:
     return result
 
 def extract_text(payload: dict) -> str:
-    """Extract text from vLLM response (supports both raw vLLM and handler endpoint)."""
+    """Extract text from response across common shapes (vLLM/raw/handler/chat).
+
+    Supports:
+    - Handler/completions: output.choices[0].text or tokens
+    - Chat-style: output.choices[0].message.content or delta.content
+    - Raw list format: output[0].choices[0].text/tokens/message.content
+    - Plain string output
+    - Root-level fallbacks: output.text, output.output_text, payload.text, payload.output_text
+    """
     out = payload.get("output", [])
 
-    # Handler endpoint format: dict with choices[0].text
+    # Helper to extract from a single choice dict
+    def choice_text(choice: dict) -> str:
+        # Chat-style content
+        msg = choice.get("message") or {}
+        if isinstance(msg, dict):
+            content = msg.get("content")
+            if isinstance(content, str) and content:
+                return content
+        delta = choice.get("delta") or {}
+        if isinstance(delta, dict):
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                return content
+        # Completions-style
+        text = choice.get("text")
+        if isinstance(text, str) and text:
+            return text
+        tokens = choice.get("tokens")
+        if isinstance(tokens, list) and tokens:
+            return _join_tokens(tokens)
+        return ""
+
+    # Handler endpoint format: dict with choices OR text
     if isinstance(out, dict):
         choices = out.get("choices", [])
-        if choices:
-            # Try text first, then join all tokens (handles object tokens)
-            text = choices[0].get("text", "")
-            if text:
-                return text
-            tokens = choices[0].get("tokens", [])
-            return _join_tokens(tokens)
-        # Fallback: check for text at root of output dict
-        return out.get("text", "")
+        if isinstance(choices, list) and choices:
+            ctext = choice_text(choices[0] or {})
+            if ctext:
+                return ctext
+        # Common fallbacks on output root
+        for key in ("text", "output_text"):
+            val = out.get(key)
+            if isinstance(val, str) and val:
+                return val
 
-    # Raw vLLM format: list with choices[0].tokens
+    # Raw vLLM format: list with choices
     if isinstance(out, list) and out:
-        choices = out[0].get("choices", [])
-        if choices:
-            # Try text first (handler), then join all tokens (raw vLLM, handles object tokens)
-            text = choices[0].get("text", "")
-            if text:
-                return text
-            tokens = choices[0].get("tokens", [])
-            return _join_tokens(tokens)
+        first = out[0] or {}
+        choices = first.get("choices", [])
+        if isinstance(choices, list) and choices:
+            ctext = choice_text(choices[0] or {})
+            if ctext:
+                return ctext
+        # Fallbacks on the first item
+        for key in ("text", "output_text"):
+            val = first.get(key)
+            if isinstance(val, str) and val:
+                return val
 
-    # Edge case: output is a plain string
+    # Edge: output is a plain string
     if isinstance(out, str):
         return out
 
-    # Last resort: check for text at payload root
-    return payload.get("text", "")
+    # Root-level fallbacks
+    for key in ("text", "output_text"):
+        val = payload.get(key)
+        if isinstance(val, str) and val:
+            return val
+
+    return ""
 
 def extract_usage(payload: dict) -> dict | None:
     """Extract usage stats from response (supports both formats)."""
@@ -671,7 +716,9 @@ def get_clarifier(domain: str, variants: list[dict] = None) -> str:
             "senior_lead": " Focus on leadership impact and business outcomes.",
             "technical_depth": " Include specific technical details and architecture decisions.",
             "quick_screen": " Keep concise (80-120 words) focusing on must-haves.",
-            "streaming_aware": " Emphasize streaming/event-driven expertise and relevant communities.",
+            "streaming_aware": (
+                " Include Boolean sourcing patterns (JMS/ActiveMQ/RabbitMQ/Kinesis/Pulsar/Reactor/Netty), 4–6 channels with cadence, a personalized outreach opener, two screening prompts, and 1–2 metrics."
+            ),
             "senior_executive": " Focus on executive search and longer hiring cycles.",
             "tech_deep_dive": " Include tech stack and compliance details.",
             "remote_distributed": " Emphasize remote work and distributed collaboration.",
