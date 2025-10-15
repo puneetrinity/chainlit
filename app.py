@@ -76,12 +76,15 @@ def validate_jd(text: str) -> tuple[bool, list[str]]:
 
 def validate_match(text: str) -> tuple[bool, list[str]]:
     issues = []
-    if len(text.split()) < 80:
+    if len(text.split()) < 60:
         issues.append("len")
     if not re.search(r'\b\d{1,3}\s*%|\bscore[:\s]+\d{1,3}', text, re.I):
         issues.append("score")
     if sum(w in text.lower() for w in ["match", "gap", "skill"]) < 2:
         issues.append("content")
+    # Check for rationale keywords
+    if not any(w in text.lower() for w in ["because", "due to", "since", "as", "reason", "strong", "weak", "partial"]):
+        issues.append("rationale")
     return (len(issues) == 0), issues
 
 def validate_recruit(text: str) -> tuple[bool, list[str]]:
@@ -120,7 +123,11 @@ def build_chatml(domain: str, user_prompt: str) -> str:
             "Requirements (6-8 bullets). Keep 150-200 words.\n\nExample:\n" + JD_EXAMPLE
         )
     elif domain == "job_resume_match":
-        sys_txt = "You are a technical recruiter. Provide: Score (0-100), Matches (5+), Gaps (3+), Next steps (3+). Keep 120-180 words."
+        sys_txt = (
+            "You are a technical recruiter. Provide: Score (0-100) with brief explanation of why this score, "
+            "Matches (5+ skills/experiences aligned), Gaps (3+ missing skills), Next steps (3+ recommendations). "
+            "Explain your reasoning for the score. Keep 100-150 words."
+        )
     elif domain == "recruiting_strategy":
         sys_txt = (
             "You are a recruiting strategist. Provide 4–6 numbered steps. Include at least 3 of these exact terms: "
@@ -251,7 +258,7 @@ def get_clarifier(domain: str) -> str:
     clarifiers = {
         "resume_guidance": " Ensure 6–8 bullets with action verbs and end with: ATS Keywords: ...",
         "job_description": " Ensure sections: Summary + Responsibilities (6–8) + Requirements (6–8).",
-        "job_resume_match": " Ensure Score (0–100), Matches (5+), Gaps (3+), Next steps (3+).",
+        "job_resume_match": " Ensure Score (0–100) with explanation of why, Matches (5+), Gaps (3+), Next steps (3+). Explain the reasoning behind the score.",
         "recruiting_strategy": " Mention LinkedIn, referral, meetup, university, conference, GitHub, Stack Overflow and cadence weekly/monthly/quarterly.",
         "ats_keywords": " Provide 20–40 comma-separated keywords (80–120 words)."
     }
