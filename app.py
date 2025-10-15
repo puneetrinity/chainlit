@@ -173,20 +173,39 @@ HR_TASKS = {
 }
 
 def extract_text(payload: dict) -> str:
-    """Extract text from vLLM response."""
+    """Extract text from vLLM response (supports both raw vLLM and handler endpoint)."""
     out = payload.get("output", [])
+
+    # Handler endpoint format: dict with choices[0].text
+    if isinstance(out, dict):
+        choices = out.get("choices", [])
+        if choices:
+            return choices[0].get("text", "") or (choices[0].get("tokens", [""])[0] if "tokens" in choices[0] else "")
+
+    # Raw vLLM format: list with choices[0].tokens
     if isinstance(out, list) and out:
         choices = out[0].get("choices", [])
         if choices:
-            tokens = choices[0].get("tokens", [])
-            return tokens[0] if tokens else ""
+            # Try tokens first (raw vLLM), then text (handler)
+            if "tokens" in choices[0]:
+                tokens = choices[0].get("tokens", [])
+                return tokens[0] if tokens else ""
+            return choices[0].get("text", "")
+
     return ""
 
 def extract_usage(payload: dict) -> dict | None:
-    """Extract usage stats from response."""
+    """Extract usage stats from response (supports both formats)."""
     out = payload.get("output", [])
+
+    # Handler endpoint format: dict with usage
+    if isinstance(out, dict):
+        return out.get("usage")
+
+    # Raw vLLM format: list with usage
     if isinstance(out, list) and out:
         return out[0].get("usage")
+
     return None
 
 async def call_endpoint(prompt: str, sampling: dict) -> dict:
