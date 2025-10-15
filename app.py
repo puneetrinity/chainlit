@@ -41,8 +41,8 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# Seeded domains (start with "1. ")
-SEEDED = {"resume_guidance", "recruiting_strategy", "ats_keywords"}
+# Seeded domains (start with "1. ") - excludes ats_keywords (comma-separated output)
+SEEDED = {"resume_guidance", "recruiting_strategy"}
 
 # 1-shot examples
 RESUME_EXAMPLE = (
@@ -256,19 +256,32 @@ def extract_text(payload: dict) -> str:
     if isinstance(out, dict):
         choices = out.get("choices", [])
         if choices:
-            return choices[0].get("text", "") or (choices[0].get("tokens", [""])[0] if "tokens" in choices[0] else "")
+            # Try text first, then join all tokens
+            text = choices[0].get("text", "")
+            if text:
+                return text
+            tokens = choices[0].get("tokens", [])
+            return "".join(tokens) if tokens else ""
+        # Fallback: check for text at root of output dict
+        return out.get("text", "")
 
     # Raw vLLM format: list with choices[0].tokens
     if isinstance(out, list) and out:
         choices = out[0].get("choices", [])
         if choices:
-            # Try tokens first (raw vLLM), then text (handler)
-            if "tokens" in choices[0]:
-                tokens = choices[0].get("tokens", [])
-                return tokens[0] if tokens else ""
-            return choices[0].get("text", "")
+            # Try text first (handler), then join all tokens (raw vLLM)
+            text = choices[0].get("text", "")
+            if text:
+                return text
+            tokens = choices[0].get("tokens", [])
+            return "".join(tokens) if tokens else ""
 
-    return ""
+    # Edge case: output is a plain string
+    if isinstance(out, str):
+        return out
+
+    # Last resort: check for text at payload root
+    return payload.get("text", "")
 
 def extract_usage(payload: dict) -> dict | None:
     """Extract usage stats from response (supports both formats)."""
@@ -543,10 +556,12 @@ async def send_query(prompt: str, domain: str, sampling: dict, enable_validation
     out = cl.Message(content="")
     await out.send()
 
-    # Stream by words
-    for token in text.split():
-        await asyncio.sleep(0)  # yield
-        await out.stream_token(token + " ")
+    # Stream by chunks, preserving whitespace and formatting
+    chunks = re.split(r'(\s+)', text)
+    for chunk in chunks:
+        if chunk:  # Skip empty strings
+            await asyncio.sleep(0)  # yield
+            await out.stream_token(chunk)
 
     # Add status footer
     await out.stream_token(status)
@@ -556,12 +571,15 @@ def detect_domain(prompt: str) -> str | None:
     """Detect HR domain from user prompt (heuristic fallback)."""
     p = prompt.lower().strip()
 
-    # Small talk (greetings)
-    if any(w in p for w in ["hello", "hi ", "hey", "how are you", "good morning", "good evening"]):
+    # Small talk (greetings) - check for exact "hi" or "hi " at word boundaries
+    if any(w in p for w in ["hello", "hey", "how are you", "good morning", "good evening"]):
+        return "small_talk"
+    # Exact match for "hi" at start or with word boundary
+    if p == "hi" or p.startswith("hi ") or " hi " in p or p.endswith(" hi"):
         return "small_talk"
 
-    # ATS keywords (most specific first)
-    if any(w in p for w in ["keyword", "ats", "applicant tracking"]):
+    # ATS keywords (more specific - avoid generic "keyword")
+    if any(w in p for w in ["ats", "applicant tracking", "ats keyword", "resume keyword"]):
         return "ats_keywords"
 
     # Job-Resume match
