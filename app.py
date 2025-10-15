@@ -7,12 +7,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Setup logger for debug output (ensure console handler exists)
-logging.basicConfig(
-    level=logging.DEBUG if os.getenv("DEBUG_VARIANTS", "false").lower() == "true" else logging.INFO,
-    format="[%(name)s] %(levelname)s: %(message)s"
-)
+# Setup logger for debug output (add handler only if none exists to avoid clobbering embedded host logging)
 logger = logging.getLogger("evalmatch")
+logger.setLevel(logging.DEBUG if os.getenv("DEBUG_VARIANTS", "false").lower() == "true" else logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(name)s] %(levelname)s: %(message)s"))
+    logger.addHandler(handler)
 
 RUNPOD_BASE = os.getenv("RUNPOD_BASE", "https://api.runpod.ai/v2")
 ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID")
@@ -481,6 +482,26 @@ def _join_tokens(tokens: list) -> str:
         for t in tokens
     )
 
+def merge_sampling(base_sampling: dict, template_sampling: dict) -> dict:
+    """Merge template-level sampling overrides into base sampling.
+
+    Special handling for min_tokens: ensures max_tokens is at least min_tokens.
+    All other keys are direct overrides.
+
+    Returns a new dict with merged values (does not modify inputs).
+    """
+    result = base_sampling.copy()
+
+    for key, value in template_sampling.items():
+        if key == "min_tokens":
+            # Ensure max_tokens is at least min_tokens
+            result["max_tokens"] = max(result.get("max_tokens", 0), value)
+        else:
+            # Direct override for other keys (temperature, top_p, repetition_penalty, etc.)
+            result[key] = value
+
+    return result
+
 def extract_text(payload: dict) -> str:
     """Extract text from vLLM response (supports both raw vLLM and handler endpoint)."""
     out = payload.get("output", [])
@@ -795,14 +816,7 @@ async def send_query(prompt: str, domain: str, sampling: dict, enable_validation
 
         # Merge template-level sampling overrides if present
         if domain in TEMPLATES and TEMPLATES[domain].get("sampling"):
-            template_sampling = TEMPLATES[domain]["sampling"]
-            for key, value in template_sampling.items():
-                if key == "min_tokens":
-                    # Ensure max_tokens is at least min_tokens
-                    sampling["max_tokens"] = max(sampling.get("max_tokens", 0), value)
-                else:
-                    # Direct override for other keys
-                    sampling[key] = value
+            sampling = merge_sampling(sampling, TEMPLATES[domain]["sampling"])
 
         result = await generate_with_validation(
             domain,

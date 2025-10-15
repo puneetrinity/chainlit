@@ -6,7 +6,7 @@ or: python test_app.py
 """
 
 import sys
-from app import extract_text, select_variant, extract_slots, _join_tokens, TEMPLATES
+from app import extract_text, select_variant, extract_slots, _join_tokens, merge_sampling, TEMPLATES
 
 
 def test_join_tokens_string_tokens():
@@ -39,6 +39,45 @@ def test_join_tokens_mixed():
 def test_join_tokens_empty():
     """Test _join_tokens with empty list."""
     assert _join_tokens([]) == ""
+
+
+def test_merge_sampling_min_tokens():
+    """Test merge_sampling with min_tokens ensures max_tokens is at least min_tokens."""
+    base = {"max_tokens": 200, "temperature": 0.3}
+    template = {"min_tokens": 260}
+    result = merge_sampling(base, template)
+    assert result["max_tokens"] == 260
+    assert result["temperature"] == 0.3
+
+
+def test_merge_sampling_direct_override():
+    """Test merge_sampling with direct override (repetition_penalty)."""
+    base = {"max_tokens": 200, "temperature": 0.3, "repetition_penalty": 1.0}
+    template = {"repetition_penalty": 1.05}
+    result = merge_sampling(base, template)
+    assert result["repetition_penalty"] == 1.05
+    assert result["max_tokens"] == 200
+    assert result["temperature"] == 0.3
+
+
+def test_merge_sampling_multiple_overrides():
+    """Test merge_sampling with multiple overrides including min_tokens."""
+    base = {"max_tokens": 200, "temperature": 0.3, "top_p": 0.9}
+    template = {"min_tokens": 250, "temperature": 0.5, "repetition_penalty": 1.1}
+    result = merge_sampling(base, template)
+    assert result["max_tokens"] == 250  # Updated from min_tokens
+    assert result["temperature"] == 0.5  # Overridden
+    assert result["top_p"] == 0.9  # Preserved
+    assert result["repetition_penalty"] == 1.1  # Added
+
+
+def test_merge_sampling_no_mutation():
+    """Test merge_sampling does not mutate input dicts."""
+    base = {"max_tokens": 200, "temperature": 0.3}
+    template = {"temperature": 0.5}
+    result = merge_sampling(base, template)
+    assert base["temperature"] == 0.3  # Original unchanged
+    assert result["temperature"] == 0.5
 
 
 def test_extract_text_handler_format():
@@ -295,6 +334,10 @@ def run_tests():
         (test_join_tokens_dict_tokens, "join_tokens with dict tokens"),
         (test_join_tokens_mixed, "join_tokens with mixed tokens"),
         (test_join_tokens_empty, "join_tokens with empty list"),
+        (test_merge_sampling_min_tokens, "merge_sampling with min_tokens"),
+        (test_merge_sampling_direct_override, "merge_sampling direct override"),
+        (test_merge_sampling_multiple_overrides, "merge_sampling multiple overrides"),
+        (test_merge_sampling_no_mutation, "merge_sampling no mutation"),
         (test_extract_text_handler_format, "extract_text handler format"),
         (test_extract_text_handler_format_tokens, "extract_text handler tokens"),
         (test_extract_text_raw_vllm_format, "extract_text raw vLLM format"),
