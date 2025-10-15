@@ -414,11 +414,16 @@ async def start():
 
     # Send welcome message with actions
     await cl.Message(
-        content="👋 **Welcome to HR Career Assistant with ChatML!**\n\n"
-                "Ask career or recruiting questions, or use quick actions below:\n\n"
-                "✨ Enhanced with domain-specific prompts and validation\n"
-                "⚙️ Adjust settings in the sidebar to customize responses\n"
-                "🔧 Use `temp=0.2` inline to override temperature for a single query",
+        content="👋 **Welcome to EvalMatch Career Copilot!**\n\n"
+                "Your AI-powered assistant for smarter hiring and career growth.\n\n"
+                "**I can help you with:**\n"
+                "• 📄 Resume optimization and career guidance\n"
+                "• 📝 Job descriptions and postings\n"
+                "• 🎯 Resume-job matching and scoring\n"
+                "• 🔍 ATS keywords and optimization\n"
+                "• 📊 Recruiting strategies and pipelines\n\n"
+                "💬 Just ask naturally - I'll understand your intent automatically!\n\n"
+                "Or use quick actions below:",
         actions=actions
     ).send()
 
