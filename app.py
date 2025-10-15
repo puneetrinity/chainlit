@@ -1,10 +1,18 @@
 import os, json, asyncio, re
+import logging
 import httpx
 import chainlit as cl
 from chainlit.input_widget import Slider, Switch
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Setup logger for debug output (ensure console handler exists)
+logging.basicConfig(
+    level=logging.DEBUG if os.getenv("DEBUG_VARIANTS", "false").lower() == "true" else logging.INFO,
+    format="[%(name)s] %(levelname)s: %(message)s"
+)
+logger = logging.getLogger("evalmatch")
 
 RUNPOD_BASE = os.getenv("RUNPOD_BASE", "https://api.runpod.ai/v2")
 ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID")
@@ -41,8 +49,8 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# Seeded domains (start with "1. ") - excludes ats_keywords (comma-separated output)
-SEEDED = {"resume_guidance", "recruiting_strategy"}
+# Global style rules for all HR domains
+HR_STYLE_RULES = "No preambles/disclaimers; return only the requested sections; concise, numbered where applicable; no markdown metadata."
 
 # 1-shot examples
 RESUME_EXAMPLE = (
@@ -60,6 +68,195 @@ JD_EXAMPLE = (
     "Responsibilities:\n1. Design REST APIs\n2. Optimize DB queries\n3. Implement security\n4. Collaborate with DevOps\n5. Code reviews\n6. Monitor SLIs/SLOs\n"
     "Requirements:\n1. 5+ yrs backend\n2. Python/Go/Node\n3. SQL/NoSQL\n4. AWS/GCP\n5. System design\n6. Communication\n"
 )
+
+# Template Registry with Variants
+TEMPLATES = {
+    "resume_guidance": {
+        "seed": True,
+        "base": "You are a career coach specializing in resumes. Provide 6-8 numbered bullets using action verbs. End with: \"ATS Keywords: ...\" (comma-separated).",
+        "example": RESUME_EXAMPLE,
+        "variants": [
+            {
+                "name": "senior_lead",
+                "hint": "Focus on leadership scope (team size, budget, cross-functional impact), strategic initiatives, and measurable business outcomes. Emphasize ownership and mentorship."
+            },
+            {
+                "name": "technical_depth",
+                "hint": "Highlight technical depth: specific technologies, architecture decisions, performance optimizations, and technical challenges overcome."
+            }
+        ]
+    },
+    "job_description": {
+        "seed": False,
+        "base": "You are an HR specialist. Create a JD with sections: Summary (2-3 lines), Responsibilities (6-8 bullets), Requirements (6-8 bullets). Keep 150-200 words.",
+        "example": JD_EXAMPLE,
+        "max_variants": 2,  # Allow both tech and remote variants
+        "variants": [
+            {
+                "name": "tech_deep_dive",
+                "hint": "Include specific tech stack details, infrastructure requirements, and compliance/security standards (e.g., PCI, SOC2, HIPAA, ISO 27001) if relevant."
+            },
+            {
+                "name": "remote_distributed",
+                "hint": "Emphasize remote work expectations, communication practices, timezone considerations, and distributed team collaboration."
+            }
+        ]
+    },
+    "job_resume_match": {
+        "seed": False,
+        "base": "You are a technical recruiter. Provide: Score (0-100) with brief explanation of why this score, Matches (5+ skills/experiences aligned), Gaps (3+ missing skills), Next steps (3+ recommendations). Explain your reasoning for the score. Keep 100-150 words.",
+        "example": None,
+        "sampling": {"min_tokens": 260},  # Ensure sufficient length for detailed analysis
+        "variants": [
+            {
+                "name": "quick_screen",
+                "hint": "Provide a concise screening assessment (80-120 words). Focus on critical must-haves and deal-breakers."
+            }
+        ]
+    },
+    "recruiting_strategy": {
+        "seed": True,
+        "base": "You are a recruiting strategist. Provide 4–6 numbered steps. Include at least 3 of these exact terms: LinkedIn, referral, meetup, university, conference, GitHub, Stack Overflow. Include cadence (weekly/monthly/quarterly) and 1–2 metrics (response rate %, time-to-hire). Keep 100–150 words.",
+        "example": None,
+        "variants": [
+            {
+                "name": "streaming_aware",
+                "hint": "For streaming/real-time roles: emphasize Kafka, event-driven architecture, backpressure handling, reactive systems communities and specific tech meetups."
+            },
+            {
+                "name": "senior_executive",
+                "hint": "For senior/executive roles: focus on executive recruiters, industry connections, board networks, and longer hiring cycles (2-4 months)."
+            }
+        ]
+    },
+    "ats_keywords": {
+        "seed": False,
+        "base": "You are a resume optimization specialist. Provide 20–40 ATS keywords comma-separated (80–120 words). Include technical tools, domains, certifications, and soft skills.",
+        "example": None,
+        "sampling": {"repetition_penalty": 1.05},  # Slight penalty to reduce keyword repetition
+        "variants": [
+            {
+                "name": "role_specific",
+                "hint": "Tailor keywords specifically for {role}: include role-specific tools, frameworks, methodologies, and industry-standard certifications."
+            }
+        ]
+    }
+}
+
+def extract_slots(prompt: str) -> dict[str, str | None]:
+    """Extract role, stack, and location slots from user prompt."""
+    p = prompt.lower()
+    slots = {"role": None, "stack": None, "location": None}
+
+    # Role detection
+    roles = {
+        "android": "Android Developer",
+        "ios": "iOS Developer",
+        "data engineer": "Data Engineer",
+        "data scientist": "Data Scientist",
+        "ml engineer": "ML Engineer",
+        "machine learning": "ML Engineer",
+        "sre": "SRE",
+        "site reliability": "SRE",
+        "devops": "DevOps Engineer",
+        "backend": "Backend Engineer",
+        "frontend": "Frontend Engineer",
+        "fullstack": "Fullstack Engineer",
+        "full stack": "Fullstack Engineer",
+        "qa": "QA Engineer",
+        "security": "Security Engineer"
+    }
+
+    for keyword, role in roles.items():
+        if keyword in p:
+            slots["role"] = role
+            break
+
+    # Stack detection (golang in list, "go" handled separately with word boundaries)
+    stacks_exact = ["java", "python", "javascript", "typescript", "golang", "rust", "c++",
+                    "kafka", "kubernetes", "k8s", "docker", "react", "angular", "vue",
+                    "aws", "gcp", "azure", "terraform", "fastapi", "django", "flask"]
+
+    found_stacks = []
+    for s in stacks_exact:
+        if s in p:
+            found_stacks.append(s)
+
+    # Check for "go" separately with word boundaries to avoid "going", "goal", "cargo", etc.
+    if re.search(r'\bgo\b', p):
+        found_stacks.append("go")
+
+    if found_stacks:
+        slots["stack"] = ", ".join(found_stacks[:3])  # Top 3
+
+    # Location detection (use word boundaries for short names)
+    if "remote" in p or "distributed" in p:
+        slots["location"] = "Remote"
+    elif "san francisco" in p or re.search(r'\bsf\b', p):
+        slots["location"] = "San Francisco"
+    elif "new york" in p or re.search(r'\bnyc\b', p):
+        slots["location"] = "New York"
+    elif "london" in p:
+        slots["location"] = "London"
+    elif "bangalore" in p:
+        slots["location"] = "Bangalore"
+
+    return slots
+
+def select_variant(domain: str, prompt: str, slots: dict) -> list[dict]:
+    """Select variant hint pack(s) based on user prompt and slots. Returns list (can be empty, single, or multiple)."""
+    p = prompt.lower()
+
+    if domain not in TEMPLATES or not TEMPLATES[domain].get("variants"):
+        return []
+
+    variants = TEMPLATES[domain]["variants"]
+    selected = []
+
+    # Domain-specific triggers
+    if domain == "resume_guidance":
+        # senior_lead trigger
+        if any(w in p for w in ["senior", "lead", "principal", "staff", "director", "vp", "cto", "head of"]):
+            selected.append(variants[0])  # senior_lead
+        # technical_depth trigger
+        elif any(w in p for w in ["architect", "technical", "system design", "performance", "optimization"]):
+            selected.append(variants[1])  # technical_depth
+
+    elif domain == "job_description":
+        # tech_deep_dive trigger (tighter compliance checks)
+        has_compliance = any(w in p for w in ["compliance", "security", "pci", "soc 2", "soc2", "hipaa"]) or re.search(r'\biso\s*27001\b', p)
+        if slots.get("stack") or has_compliance:
+            selected.append(variants[0])  # tech_deep_dive
+        # remote_distributed trigger (both can be selected for JD!)
+        if slots.get("location") == "Remote" or any(w in p for w in ["remote", "distributed", "timezone"]):
+            selected.append(variants[1])  # remote_distributed
+
+    elif domain == "job_resume_match":
+        # quick_screen trigger (word boundaries)
+        if re.search(r'\b(quick|screen(ing)?|brief|short|initial)\b', p):
+            selected.append(variants[0])  # quick_screen
+
+    elif domain == "recruiting_strategy":
+        # streaming_aware trigger (more specific streaming terms)
+        has_streaming = any(w in p for w in ["kafka", "streaming", "event stream", "event-driven", "kinesis", "pulsar", "reactive"])
+        if has_streaming:
+            selected.append(variants[0])  # streaming_aware
+        # senior_executive trigger
+        elif any(w in p for w in ["senior", "executive", "director", "vp", "c-level", "cto", "ceo"]):
+            selected.append(variants[1])  # senior_executive
+
+    elif domain == "ats_keywords":
+        # role_specific trigger
+        if slots.get("role"):
+            selected.append(variants[0])  # role_specific
+
+    # Enforce max_variants cap if specified in template
+    if selected and domain in TEMPLATES:
+        max_variants = TEMPLATES[domain].get("max_variants")
+        if max_variants and len(selected) > max_variants:
+            selected = selected[:max_variants]
+
+    return selected
 
 # Validators
 def validate_resume(text: str) -> tuple[bool, list[str]]:
@@ -179,44 +376,71 @@ Return strict JSON: {{"intent":"...", "confidence":0.0-1.0}}. No extra text.<|im
         # Fallback to heuristic if router fails
         return None, 0.0
 
-# ChatML builder
-def build_chatml(domain: str, user_prompt: str) -> str:
-    if domain == "resume_guidance":
-        sys_txt = (
-            "You are a career coach specializing in resumes. Provide 6-8 numbered bullets using action verbs. "
-            'End with: "ATS Keywords: ..." (comma-separated).\n\nExample:\n' + RESUME_EXAMPLE
-        )
-    elif domain == "job_description":
-        sys_txt = (
-            "You are an HR specialist. Create a JD with sections: Summary (2-3 lines), Responsibilities (6-8 bullets), "
-            "Requirements (6-8 bullets). Keep 150-200 words.\n\nExample:\n" + JD_EXAMPLE
-        )
-    elif domain == "job_resume_match":
-        sys_txt = (
-            "You are a technical recruiter. Provide: Score (0-100) with brief explanation of why this score, "
-            "Matches (5+ skills/experiences aligned), Gaps (3+ missing skills), Next steps (3+ recommendations). "
-            "Explain your reasoning for the score. Keep 100-150 words."
-        )
-    elif domain == "recruiting_strategy":
-        sys_txt = (
-            "You are a recruiting strategist. Provide 4–6 numbered steps. Include at least 3 of these exact terms: "
-            "LinkedIn, referral, meetup, university, conference, GitHub, Stack Overflow. Include cadence "
-            "(weekly/monthly/quarterly) and 1–2 metrics (response rate %, time-to-hire). Keep 100–150 words."
-        )
-    elif domain == "ats_keywords":
-        sys_txt = (
-            "You are a resume optimization specialist. Provide 20–40 ATS keywords comma-separated (80–120 words). "
-            "Include technical tools, domains, certifications, and soft skills."
-        )
-    elif domain == "small_talk":
+# ChatML builder (variant-aware, supports multiple variants)
+def build_chatml(domain: str, user_prompt: str, variants: list[dict] = None, slots: dict | None = None, system_extra: str = "") -> str:
+    """Build ChatML prompt with base template + optional variant hints (multiple) + slots + system_extra."""
+
+    # Handle non-HR domains (small_talk, general_qna)
+    if domain == "small_talk":
         sys_txt = "You are a friendly assistant. Respond warmly in 1–3 sentences."
+        if system_extra:
+            sys_txt += system_extra
         return f"<|im_start|>system\n{sys_txt}<|im_end|>\n<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
-    else:  # general_qna
+    elif domain == "general_qna":
         sys_txt = "You are a helpful assistant. Provide concise, accurate answers."
+        if system_extra:
+            sys_txt += system_extra
         return f"<|im_start|>system\n{sys_txt}<|im_end|>\n<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
 
-    # Unreachable, but keeping for clarity of HR domains
-    seed = "1. " if domain in SEEDED else ""
+    # HR domains - use TEMPLATES registry
+    if domain not in TEMPLATES:
+        # Fallback for unknown domains
+        sys_txt = "You are a helpful assistant."
+        if system_extra:
+            sys_txt += system_extra
+        return f"<|im_start|>system\n{sys_txt}<|im_end|>\n<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
+
+    template = TEMPLATES[domain]
+
+    # Prepend global HR style rules
+    sys_txt = HR_STYLE_RULES
+
+    # Inject slots context if present
+    if slots and any(slots.values()):
+        slot_parts = []
+        if slots.get("role"):
+            slot_parts.append(f"Target role: {slots['role']}")
+        if slots.get("stack"):
+            slot_parts.append(f"stack: {slots['stack']}")
+        if slots.get("location"):
+            slot_parts.append(f"location: {slots['location']}")
+        if slot_parts:
+            sys_txt += f"\nContext: {'; '.join(slot_parts)}."
+
+    sys_txt += f"\n\n{template['base']}"
+
+    # Add variant hints if provided (multiple variants supported)
+    if variants:
+        for variant in variants:
+            hint = variant["hint"]
+            # Inject slots into hint if present
+            if slots:
+                hint = hint.format(role=slots.get("role", "the role"),
+                                  stack=slots.get("stack", "relevant technologies"),
+                                  location=slots.get("location", ""))
+            sys_txt += f"\n\nAdditional guidance: {hint}"
+
+    # Add example if present
+    if template.get("example"):
+        sys_txt += f"\n\nExample:\n{template['example']}"
+
+    # Add system_extra (e.g., clarifier on retry)
+    if system_extra:
+        sys_txt += system_extra
+
+    # Add seeding
+    seed = "1. " if template.get("seed") else ""
+
     return f"<|im_start|>system\n{sys_txt}<|im_end|>\n<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n{seed}"
 
 # HR Task Templates
@@ -248,6 +472,15 @@ HR_TASKS = {
     }
 }
 
+def _join_tokens(tokens: list) -> str:
+    """Safely join token array (handles string tokens and dict tokens with 'text' key)."""
+    if not tokens:
+        return ""
+    return "".join(
+        t if isinstance(t, str) else (t.get("text", "") if isinstance(t, dict) else str(t))
+        for t in tokens
+    )
+
 def extract_text(payload: dict) -> str:
     """Extract text from vLLM response (supports both raw vLLM and handler endpoint)."""
     out = payload.get("output", [])
@@ -256,12 +489,12 @@ def extract_text(payload: dict) -> str:
     if isinstance(out, dict):
         choices = out.get("choices", [])
         if choices:
-            # Try text first, then join all tokens
+            # Try text first, then join all tokens (handles object tokens)
             text = choices[0].get("text", "")
             if text:
                 return text
             tokens = choices[0].get("tokens", [])
-            return "".join(tokens) if tokens else ""
+            return _join_tokens(tokens)
         # Fallback: check for text at root of output dict
         return out.get("text", "")
 
@@ -269,12 +502,12 @@ def extract_text(payload: dict) -> str:
     if isinstance(out, list) and out:
         choices = out[0].get("choices", [])
         if choices:
-            # Try text first (handler), then join all tokens (raw vLLM)
+            # Try text first (handler), then join all tokens (raw vLLM, handles object tokens)
             text = choices[0].get("text", "")
             if text:
                 return text
             tokens = choices[0].get("tokens", [])
-            return "".join(tokens) if tokens else ""
+            return _join_tokens(tokens)
 
     # Edge case: output is a plain string
     if isinstance(out, str):
@@ -312,10 +545,12 @@ async def call_endpoint(prompt: str, sampling: dict) -> dict:
             raise Exception(f"Error {r.status_code}: {r.text[:300]}")
         return r.json()
 
-async def generate_with_validation(domain: str, user_prompt: str, sampling: dict, enable_validation: bool, micro_retry: bool) -> dict:
+async def generate_with_validation(domain: str, user_prompt: str, sampling: dict,
+                                   enable_validation: bool, micro_retry: bool,
+                                   variants: list[dict] = None, slots: dict | None = None) -> dict:
     """Generate response with optional validation and micro-retry."""
     # First attempt
-    chat = build_chatml(domain, user_prompt)
+    chat = build_chatml(domain, user_prompt, variants=variants, slots=slots)
     response = await call_endpoint(chat, sampling)
     text = extract_text(response)
     usage = extract_usage(response)
@@ -327,8 +562,8 @@ async def generate_with_validation(domain: str, user_prompt: str, sampling: dict
 
         # Micro-retry if validation fails and micro_retry enabled
         if not ok and micro_retry:
-            clarifier = get_clarifier(domain)
-            chat_retry = build_chatml(domain, user_prompt + clarifier)
+            clarifier = get_clarifier(domain, variants=variants)
+            chat_retry = build_chatml(domain, user_prompt, variants=variants, slots=slots, system_extra=clarifier)
             response2 = await call_endpoint(chat_retry, sampling)
             text2 = extract_text(response2)
             ok2, issues2 = VALIDATORS[domain](text2)
@@ -339,7 +574,8 @@ async def generate_with_validation(domain: str, user_prompt: str, sampling: dict
                 "issues": issues2,
                 "exec_time": response2.get("executionTime", 0),
                 "retried": True,
-                "usage": extract_usage(response2)
+                "usage": extract_usage(response2),
+                "variants": variants
             }
 
         return {
@@ -348,7 +584,8 @@ async def generate_with_validation(domain: str, user_prompt: str, sampling: dict
             "issues": issues,
             "exec_time": exec_time,
             "retried": False,
-            "usage": usage
+            "usage": usage,
+            "variants": variants
         }
 
     # No validation
@@ -358,19 +595,40 @@ async def generate_with_validation(domain: str, user_prompt: str, sampling: dict
         "issues": [],
         "exec_time": exec_time,
         "retried": False,
-        "usage": usage
+        "usage": usage,
+        "variants": variants
     }
 
-def get_clarifier(domain: str) -> str:
-    """Get clarifier text for micro-retry."""
-    clarifiers = {
+def get_clarifier(domain: str, variants: list[dict] = None) -> str:
+    """Get clarifier text for micro-retry (variant-aware, supports multiple variants)."""
+    base_clarifiers = {
         "resume_guidance": " Ensure 6–8 bullets with action verbs and end with: ATS Keywords: ...",
         "job_description": " Ensure sections: Summary + Responsibilities (6–8) + Requirements (6–8).",
-        "job_resume_match": " Ensure Score (0–100) with explanation of why, Matches (5+), Gaps (3+), Next steps (3+). Explain the reasoning behind the score.",
+        "job_resume_match": " Ensure Score (0–100) with explanation of why, Matches (5+), Gaps (3+), Next steps (3+). Explain the reasoning behind the score. Keep 100–150 words.",
         "recruiting_strategy": " Mention LinkedIn, referral, meetup, university, conference, GitHub, Stack Overflow and cadence weekly/monthly/quarterly.",
         "ats_keywords": " Provide 20–40 comma-separated keywords (80–120 words)."
     }
-    return clarifiers.get(domain, "")
+
+    clarifier = base_clarifiers.get(domain, "")
+
+    # Add variant-specific clarifications (multiple variants supported)
+    if variants:
+        variant_clarifiers = {
+            "senior_lead": " Focus on leadership impact and business outcomes.",
+            "technical_depth": " Include specific technical details and architecture decisions.",
+            "quick_screen": " Keep concise (80-120 words) focusing on must-haves.",
+            "streaming_aware": " Emphasize streaming/event-driven expertise and relevant communities.",
+            "senior_executive": " Focus on executive search and longer hiring cycles.",
+            "tech_deep_dive": " Include tech stack and compliance details.",
+            "remote_distributed": " Emphasize remote work and distributed collaboration.",
+            "role_specific": " Tailor keywords to the specific role."
+        }
+        for variant in variants:
+            variant_name = variant["name"]
+            if variant_name in variant_clarifiers:
+                clarifier += variant_clarifiers[variant_name]
+
+    return clarifier
 
 @cl.on_chat_start
 async def start():
@@ -522,7 +780,39 @@ async def send_query(prompt: str, domain: str, sampling: dict, enable_validation
     actual_retry = micro_retry and is_hr_domain
 
     try:
-        result = await generate_with_validation(domain, prompt, sampling, actual_validation, actual_retry)
+        # Select variants and extract slots for HR domains
+        variants = []
+        slots = None
+        if is_hr_domain:
+            slots = extract_slots(prompt)
+            variants = select_variant(domain, prompt, slots)
+
+            # Debug logging (controlled by logger level)
+            variant_names = [v["name"] for v in variants] if variants else []
+            logger.debug(f"Domain: {domain}")
+            logger.debug(f"Selected variants: {variant_names}")
+            logger.debug(f"Extracted slots: {slots}")
+
+        # Merge template-level sampling overrides if present
+        if domain in TEMPLATES and TEMPLATES[domain].get("sampling"):
+            template_sampling = TEMPLATES[domain]["sampling"]
+            for key, value in template_sampling.items():
+                if key == "min_tokens":
+                    # Ensure max_tokens is at least min_tokens
+                    sampling["max_tokens"] = max(sampling.get("max_tokens", 0), value)
+                else:
+                    # Direct override for other keys
+                    sampling[key] = value
+
+        result = await generate_with_validation(
+            domain,
+            prompt,
+            sampling,
+            actual_validation,
+            actual_retry,
+            variants=variants,
+            slots=slots,
+        )
     except Exception as e:
         await thinking.update(content=f"❌ Request error: {e}")
         return
@@ -541,6 +831,12 @@ async def send_query(prompt: str, domain: str, sampling: dict, enable_validation
             status_parts.append(f"🎯 Detected: {domain} ({conf:.0%})")
         else:
             status_parts.append(f"🎯 Detected: {domain}")
+
+    # Add variant info if present (support multiple variants)
+    variants_info = result.get("variants")
+    if variants_info:
+        variant_names = ", ".join([v["name"] for v in variants_info])
+        status_parts.append(f"🧩 Variant: {variant_names}")
 
     if result.get("retried"):
         status_parts.append("🔄 Retried")
@@ -578,8 +874,8 @@ def detect_domain(prompt: str) -> str | None:
     if p == "hi" or p.startswith("hi ") or " hi " in p or p.endswith(" hi"):
         return "small_talk"
 
-    # ATS keywords (more specific - avoid generic "keyword")
-    if any(w in p for w in ["ats", "applicant tracking", "ats keyword", "resume keyword"]):
+    # ATS keywords (use word boundaries to avoid "stats" false positives)
+    if re.search(r'\bats\b', p) or any(w in p for w in ["applicant tracking", "ats keyword", "resume keyword", "applicant tracking system"]):
         return "ats_keywords"
 
     # Job-Resume match
