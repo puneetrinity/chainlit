@@ -80,6 +80,42 @@ def test_merge_sampling_no_mutation():
     assert result["temperature"] == 0.5
 
 
+def test_merge_sampling_temperature_clamping():
+    """Test merge_sampling clamps temperature to [0, 1]."""
+    base = {"max_tokens": 200}
+    template = {"temperature": 1.5}
+    result = merge_sampling(base, template)
+    assert result["temperature"] == 1.0  # Clamped to max
+
+    template = {"temperature": -0.1}
+    result = merge_sampling(base, template)
+    assert result["temperature"] == 0.0  # Clamped to min
+
+
+def test_merge_sampling_top_p_clamping():
+    """Test merge_sampling clamps top_p to [0, 1]."""
+    base = {"max_tokens": 200}
+    template = {"top_p": 2.0}
+    result = merge_sampling(base, template)
+    assert result["top_p"] == 1.0  # Clamped to max
+
+    template = {"top_p": -0.5}
+    result = merge_sampling(base, template)
+    assert result["top_p"] == 0.0  # Clamped to min
+
+
+def test_merge_sampling_stop_coercion():
+    """Test merge_sampling coerces stop to list."""
+    base = {"max_tokens": 200}
+    template = {"stop": "</s>"}
+    result = merge_sampling(base, template)
+    assert result["stop"] == ["</s>"]  # String coerced to list
+
+    template = {"stop": ["</s>", "<|end|>"]}
+    result = merge_sampling(base, template)
+    assert result["stop"] == ["</s>", "<|end|>"]  # List preserved
+
+
 def test_extract_text_handler_format():
     """Test extract_text with handler endpoint format (dict with choices[0].text)."""
     payload = {
@@ -338,6 +374,9 @@ def run_tests():
         (test_merge_sampling_direct_override, "merge_sampling direct override"),
         (test_merge_sampling_multiple_overrides, "merge_sampling multiple overrides"),
         (test_merge_sampling_no_mutation, "merge_sampling no mutation"),
+        (test_merge_sampling_temperature_clamping, "merge_sampling temperature clamping"),
+        (test_merge_sampling_top_p_clamping, "merge_sampling top_p clamping"),
+        (test_merge_sampling_stop_coercion, "merge_sampling stop coercion"),
         (test_extract_text_handler_format, "extract_text handler format"),
         (test_extract_text_handler_format_tokens, "extract_text handler tokens"),
         (test_extract_text_raw_vllm_format, "extract_text raw vLLM format"),

@@ -14,6 +14,7 @@ if not logger.handlers:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("[%(name)s] %(levelname)s: %(message)s"))
     logger.addHandler(handler)
+    logger.propagate = False  # Prevent double emission if parent handlers exist
 
 RUNPOD_BASE = os.getenv("RUNPOD_BASE", "https://api.runpod.ai/v2")
 ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID")
@@ -485,8 +486,10 @@ def _join_tokens(tokens: list) -> str:
 def merge_sampling(base_sampling: dict, template_sampling: dict) -> dict:
     """Merge template-level sampling overrides into base sampling.
 
-    Special handling for min_tokens: ensures max_tokens is at least min_tokens.
-    All other keys are direct overrides.
+    Special handling:
+    - min_tokens: ensures max_tokens is at least min_tokens
+    - temperature/top_p: clamped to [0, 1]
+    - stop: coerced to list if needed
 
     Returns a new dict with merged values (does not modify inputs).
     """
@@ -496,8 +499,14 @@ def merge_sampling(base_sampling: dict, template_sampling: dict) -> dict:
         if key == "min_tokens":
             # Ensure max_tokens is at least min_tokens
             result["max_tokens"] = max(result.get("max_tokens", 0), value)
+        elif key in ("temperature", "top_p"):
+            # Clamp to [0, 1] for safety
+            result[key] = max(0.0, min(1.0, float(value)))
+        elif key == "stop":
+            # Ensure stop is a list for decoder compatibility
+            result[key] = value if isinstance(value, (list, tuple)) else [value]
         else:
-            # Direct override for other keys (temperature, top_p, repetition_penalty, etc.)
+            # Direct override for other keys (repetition_penalty, max_tokens, etc.)
             result[key] = value
 
     return result
