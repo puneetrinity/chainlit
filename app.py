@@ -124,7 +124,7 @@ VALIDATORS = {
 async def classify_with_llm(user_prompt: str) -> tuple[str | None, float]:
     """Classify user prompt using LLM router with JSON response."""
     router_prompt = f"""<|im_start|>system
-You are a router that classifies the user's request into one of:
+You are a router that classifies HR/career requests into one of:
 
 - resume_guidance
 - job_description
@@ -134,7 +134,16 @@ You are a router that classifies the user's request into one of:
 - small_talk
 - general_qna
 
-Return strict JSON: {{"intent":"...", "confidence":0.0-1.0}}. No extra text. If uncertain, general_qna with confidence ≤ 0.55.<|im_end|>
+Key rules:
+
+- "strategy to hire/recruit/get/find/attract/source developers/candidates" → recruiting_strategy
+- "hiring pipeline / talent acquisition / onboarding plan" → recruiting_strategy
+- "job description / JD / job posting / job ad" → job_description
+- "match score / score: / alignment / fit score" → job_resume_match
+- "ATS / applicant tracking / keywords" → ats_keywords
+- Greetings ("hello", "how are you", "hey") → small_talk
+
+Return strict JSON: {{"intent":"...", "confidence":0.0-1.0}}. No extra text.<|im_end|>
 <|im_start|>user
 {user_prompt}<|im_end|>
 <|im_start|>assistant
@@ -150,21 +159,23 @@ Return strict JSON: {{"intent":"...", "confidence":0.0-1.0}}. No extra text. If 
 
     try:
         response = await call_endpoint(router_prompt, sampling)
-        text = extract_text(response)
+        text = extract_text(response) or ""
 
         # Parse JSON robustly
         match = re.search(r'\{.*?\}', text, flags=re.S)
-        if match:
-            data = json.loads(match.group(0))
-            intent = data.get("intent")
-            confidence = float(data.get("confidence", 0))
+        if not match:
+            return None, 0.0
 
-            # Validate intent is in allowed labels
-            if intent in ROUTER_LABELS:
-                return intent, confidence
+        data = json.loads(match.group(0))
+        intent = data.get("intent")
+        confidence = float(data.get("confidence") or 0.0)
+
+        # Validate intent is in allowed labels
+        if intent in ROUTER_LABELS:
+            return intent, confidence
 
         return None, 0.0
-    except Exception as e:
+    except Exception:
         # Fallback to heuristic if router fails
         return None, 0.0
 
@@ -198,10 +209,13 @@ def build_chatml(domain: str, user_prompt: str) -> str:
             "Include technical tools, domains, certifications, and soft skills."
         )
     elif domain == "small_talk":
-        sys_txt = "You are a friendly HR career assistant. Respond warmly and helpfully to casual conversation."
+        sys_txt = "You are a friendly assistant. Respond warmly in 1–3 sentences."
+        return f"<|im_start|>system\n{sys_txt}<|im_end|>\n<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
     else:  # general_qna
-        sys_txt = "You are an HR career assistant. Provide helpful information about careers, workplace topics, and professional development."
+        sys_txt = "You are a helpful assistant. Provide concise, accurate answers."
+        return f"<|im_start|>system\n{sys_txt}<|im_end|>\n<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n"
 
+    # Unreachable, but keeping for clarity of HR domains
     seed = "1. " if domain in SEEDED else ""
     return f"<|im_start|>system\n{sys_txt}<|im_end|>\n<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n{seed}"
 
@@ -538,31 +552,35 @@ async def send_query(prompt: str, domain: str, sampling: dict, enable_validation
     await out.stream_token(status)
     await out.update()
 
-def detect_domain(prompt: str) -> str:
-    """Detect HR domain from user prompt."""
-    prompt_lower = prompt.lower()
+def detect_domain(prompt: str) -> str | None:
+    """Detect HR domain from user prompt (heuristic fallback)."""
+    p = prompt.lower().strip()
+
+    # Small talk (greetings)
+    if any(w in p for w in ["hello", "hi ", "hey", "how are you", "good morning", "good evening"]):
+        return "small_talk"
 
     # ATS keywords (most specific first)
-    if any(kw in prompt_lower for kw in ["keyword", "ats", "applicant tracking"]):
+    if any(w in p for w in ["keyword", "ats", "applicant tracking"]):
         return "ats_keywords"
 
     # Job-Resume match
-    if any(kw in prompt_lower for kw in ["match", "score", "gap", "fit", "alignment"]):
+    if any(w in p for w in ["match score", "score:", "alignment", "fit score"]):
         return "job_resume_match"
 
     # Job description
-    if any(kw in prompt_lower for kw in ["job description", "jd", "job posting", "job ad"]):
+    if any(w in p for w in ["job description", "jd", "job posting", "job ad"]):
         return "job_description"
 
     # Recruiting strategy (before resume to catch "pipeline", "hire", etc.)
-    if any(kw in prompt_lower for kw in ["recruit", "sourcing", "hiring", "pipeline", "talent acquisition", "candidate", "hire", "onboard"]):
+    if any(w in p for w in ["recruit", "sourcing", "hiring", "pipeline", "talent acquisition", "candidate", "hire", "onboard", "attract", "find developers", "get developers", "strategy to"]):
         return "recruiting_strategy"
 
     # Resume guidance
-    if any(kw in prompt_lower for kw in ["resume", "cv", "bullet", "achievement", "experience"]):
+    if any(w in p for w in ["resume", "cv", "bullet", "achievement", "experience"]):
         return "resume_guidance"
 
-    # If no domain detected, return None for general queries
+    # If no domain detected, return None
     return None
 
 @cl.on_message
