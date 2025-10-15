@@ -22,8 +22,19 @@ DEFAULT_SAMPLING = {
 
 DEFAULT_FLAGS = {
     "enable_validation": True,
-    "micro_retry": True
+    "micro_retry": True,
+    "use_llm_router": True
 }
+
+ROUTER_LABELS = [
+    "resume_guidance",
+    "job_description",
+    "job_resume_match",
+    "recruiting_strategy",
+    "ats_keywords",
+    "small_talk",
+    "general_qna"
+]
 
 HEADERS = {
     "Authorization": f"Bearer {API_KEY}",
@@ -110,6 +121,53 @@ VALIDATORS = {
     "ats_keywords": validate_ats
 }
 
+async def classify_with_llm(user_prompt: str) -> tuple[str | None, float]:
+    """Classify user prompt using LLM router with JSON response."""
+    router_prompt = f"""<|im_start|>system
+You are a router that classifies the user's request into one of:
+
+- resume_guidance
+- job_description
+- job_resume_match
+- recruiting_strategy
+- ats_keywords
+- small_talk
+- general_qna
+
+Return strict JSON: {{"intent":"...", "confidence":0.0-1.0}}. No extra text. If uncertain, general_qna with confidence ≤ 0.55.<|im_end|>
+<|im_start|>user
+{user_prompt}<|im_end|>
+<|im_start|>assistant
+"""
+
+    sampling = {
+        "max_tokens": 60,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "repetition_penalty": 1.0,
+        "stop": ["<|im_end|>"]
+    }
+
+    try:
+        response = await call_endpoint(router_prompt, sampling)
+        text = extract_text(response)
+
+        # Parse JSON robustly
+        match = re.search(r'\{.*?\}', text, flags=re.S)
+        if match:
+            data = json.loads(match.group(0))
+            intent = data.get("intent")
+            confidence = float(data.get("confidence", 0))
+
+            # Validate intent is in allowed labels
+            if intent in ROUTER_LABELS:
+                return intent, confidence
+
+        return None, 0.0
+    except Exception as e:
+        # Fallback to heuristic if router fails
+        return None, 0.0
+
 # ChatML builder
 def build_chatml(domain: str, user_prompt: str) -> str:
     if domain == "resume_guidance":
@@ -134,11 +192,15 @@ def build_chatml(domain: str, user_prompt: str) -> str:
             "LinkedIn, referral, meetup, university, conference, GitHub, Stack Overflow. Include cadence "
             "(weekly/monthly/quarterly) and 1–2 metrics (response rate %, time-to-hire). Keep 100–150 words."
         )
-    else:  # ats_keywords
+    elif domain == "ats_keywords":
         sys_txt = (
             "You are a resume optimization specialist. Provide 20–40 ATS keywords comma-separated (80–120 words). "
             "Include technical tools, domains, certifications, and soft skills."
         )
+    elif domain == "small_talk":
+        sys_txt = "You are a friendly HR career assistant. Respond warmly and helpfully to casual conversation."
+    else:  # general_qna
+        sys_txt = "You are an HR career assistant. Provide helpful information about careers, workplace topics, and professional development."
 
     seed = "1. " if domain in SEEDED else ""
     return f"<|im_start|>system\n{sys_txt}<|im_end|>\n<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n{seed}"
@@ -291,7 +353,8 @@ async def start():
         "top_p": DEFAULT_SAMPLING["top_p"],
         "max_tokens": DEFAULT_SAMPLING["max_tokens"],
         "enable_validation": DEFAULT_FLAGS["enable_validation"],
-        "micro_retry": DEFAULT_FLAGS["micro_retry"]
+        "micro_retry": DEFAULT_FLAGS["micro_retry"],
+        "use_llm_router": DEFAULT_FLAGS["use_llm_router"]
     })
 
     # Create settings panel
@@ -322,6 +385,12 @@ async def start():
             max=300,
             step=10,
             description="Maximum length of response"
+        ),
+        Switch(
+            id="use_llm_router",
+            label="LLM Router",
+            initial=DEFAULT_FLAGS["use_llm_router"],
+            description="Use LLM to detect intent (more accurate, +200-400ms latency)"
         ),
         Switch(
             id="enable_validation",
@@ -358,7 +427,8 @@ async def settings_update(settings):
     """Handle settings changes."""
     cl.user_session.set("settings", settings)
     await cl.Message(content=f"✅ Settings updated: temp={settings['temperature']}, top_p={settings['top_p']}, "
-                              f"validation={settings['enable_validation']}, micro_retry={settings['micro_retry']}").send()
+                              f"llm_router={settings['use_llm_router']}, validation={settings['enable_validation']}, "
+                              f"micro_retry={settings['micro_retry']}").send()
 
 @cl.action_callback("resume_guidance")
 async def on_resume_guidance(action: cl.Action):
@@ -400,9 +470,12 @@ async def process_hr_task(prompt: str, domain: str):
     enable_validation = settings.get("enable_validation", DEFAULT_FLAGS["enable_validation"])
     micro_retry = settings.get("micro_retry", DEFAULT_FLAGS["micro_retry"])
 
-    await send_query(prompt, domain, sampling, enable_validation, micro_retry)
+    # Action buttons bypass router (domain is pre-determined)
+    router_info = {"method": "action_button", "confidence": 1.0}
 
-async def send_query(prompt: str, domain: str, sampling: dict, enable_validation: bool, micro_retry: bool):
+    await send_query(prompt, domain, sampling, enable_validation, micro_retry, router_info)
+
+async def send_query(prompt: str, domain: str, sampling: dict, enable_validation: bool, micro_retry: bool, router_info: dict = None):
     """Core function to send query to RunPod and stream response."""
     if not ENDPOINT_ID or not API_KEY:
         await cl.Message(content="❌ Server missing RUNPOD_ENDPOINT_ID or RUNPOD_API_KEY.").send()
@@ -411,8 +484,13 @@ async def send_query(prompt: str, domain: str, sampling: dict, enable_validation
     thinking = cl.Message(content="🤔 Generating response...")
     await thinking.send()
 
+    # Skip validation for non-HR domains
+    is_hr_domain = domain in ["resume_guidance", "job_description", "job_resume_match", "recruiting_strategy", "ats_keywords"]
+    actual_validation = enable_validation and is_hr_domain
+    actual_retry = micro_retry and is_hr_domain
+
     try:
-        result = await generate_with_validation(domain, prompt, sampling, enable_validation, micro_retry)
+        result = await generate_with_validation(domain, prompt, sampling, actual_validation, actual_retry)
     except Exception as e:
         await thinking.update(content=f"❌ Request error: {e}")
         return
@@ -422,11 +500,21 @@ async def send_query(prompt: str, domain: str, sampling: dict, enable_validation
 
     # Build status message
     status_parts = []
+
+    # Add domain detection info
+    if router_info:
+        conf = router_info.get("confidence", 0)
+        method = router_info.get("method", "heuristic")
+        if method == "llm":
+            status_parts.append(f"🎯 Detected: {domain} ({conf:.0%})")
+        else:
+            status_parts.append(f"🎯 Detected: {domain}")
+
     if result.get("retried"):
         status_parts.append("🔄 Retried")
-    if not result.get("ok"):
+    if not result.get("ok") and is_hr_domain:
         status_parts.append(f"⚠️ Issues: {', '.join(result.get('issues', []))}")
-    if result.get("ok"):
+    if result.get("ok") and is_hr_domain:
         status_parts.append("✅ Validated")
 
     status = f"\n\n*{' • '.join(status_parts)}*" if status_parts else ""
@@ -449,19 +537,28 @@ def detect_domain(prompt: str) -> str:
     """Detect HR domain from user prompt."""
     prompt_lower = prompt.lower()
 
-    if any(kw in prompt_lower for kw in ["resume", "cv", "bullet", "achievement"]):
-        return "resume_guidance"
-    elif any(kw in prompt_lower for kw in ["job description", "jd", "responsibilities", "requirements"]):
-        return "job_description"
-    elif any(kw in prompt_lower for kw in ["match", "score", "gap", "fit"]):
-        return "job_resume_match"
-    elif any(kw in prompt_lower for kw in ["recruit", "sourcing", "hiring", "strategy", "candidate"]):
-        return "recruiting_strategy"
-    elif any(kw in prompt_lower for kw in ["keyword", "ats", "applicant tracking"]):
+    # ATS keywords (most specific first)
+    if any(kw in prompt_lower for kw in ["keyword", "ats", "applicant tracking"]):
         return "ats_keywords"
-    else:
-        # Default to resume guidance for general queries
+
+    # Job-Resume match
+    if any(kw in prompt_lower for kw in ["match", "score", "gap", "fit", "alignment"]):
+        return "job_resume_match"
+
+    # Job description
+    if any(kw in prompt_lower for kw in ["job description", "jd", "job posting", "job ad"]):
+        return "job_description"
+
+    # Recruiting strategy (before resume to catch "pipeline", "hire", etc.)
+    if any(kw in prompt_lower for kw in ["recruit", "sourcing", "hiring", "pipeline", "talent acquisition", "candidate", "hire", "onboard"]):
+        return "recruiting_strategy"
+
+    # Resume guidance
+    if any(kw in prompt_lower for kw in ["resume", "cv", "bullet", "achievement", "experience"]):
         return "resume_guidance"
+
+    # If no domain detected, return None for general queries
+    return None
 
 @cl.on_message
 async def on_message(msg: cl.Message):
@@ -474,7 +571,8 @@ async def on_message(msg: cl.Message):
         "top_p": DEFAULT_SAMPLING["top_p"],
         "max_tokens": DEFAULT_SAMPLING["max_tokens"],
         "enable_validation": DEFAULT_FLAGS["enable_validation"],
-        "micro_retry": DEFAULT_FLAGS["micro_retry"]
+        "micro_retry": DEFAULT_FLAGS["micro_retry"],
+        "use_llm_router": DEFAULT_FLAGS["use_llm_router"]
     }
 
     sampling = {
@@ -495,8 +593,31 @@ async def on_message(msg: cl.Message):
 
     enable_validation = settings.get("enable_validation", DEFAULT_FLAGS["enable_validation"])
     micro_retry = settings.get("micro_retry", DEFAULT_FLAGS["micro_retry"])
+    use_llm_router = settings.get("use_llm_router", DEFAULT_FLAGS["use_llm_router"])
 
-    # Detect domain from prompt
-    domain = detect_domain(prompt)
+    # Domain detection with LLM router
+    domain = None
+    router_info = {}
 
-    await send_query(prompt, domain, sampling, enable_validation, micro_retry)
+    if use_llm_router:
+        intent, confidence = await classify_with_llm(prompt)
+
+        if intent and confidence >= 0.6:
+            # High confidence - use LLM classification
+            domain = intent
+            router_info = {"method": "llm", "confidence": confidence}
+        elif intent and confidence >= 0.4:
+            # Medium confidence - try heuristic, fallback to LLM
+            heuristic_domain = detect_domain(prompt)
+            domain = heuristic_domain if heuristic_domain else intent
+            router_info = {"method": "hybrid", "confidence": confidence}
+        else:
+            # Low confidence - use heuristic, fallback to general_qna
+            domain = detect_domain(prompt) or "general_qna"
+            router_info = {"method": "heuristic", "confidence": confidence}
+    else:
+        # LLM router disabled - use heuristic only
+        domain = detect_domain(prompt) or "general_qna"
+        router_info = {"method": "heuristic", "confidence": 1.0}
+
+    await send_query(prompt, domain, sampling, enable_validation, micro_retry, router_info)
