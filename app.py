@@ -20,6 +20,9 @@ RUNPOD_BASE = os.getenv("RUNPOD_BASE", "https://api.runpod.ai/v2")
 ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID")
 API_KEY = os.getenv("RUNPOD_API_KEY")
 TIMEOUT = float(os.getenv("CLIENT_TIMEOUT_S", "90"))
+# Retry behavior for transient timeouts
+CLIENT_RETRY_ATTEMPTS = int(os.getenv("CLIENT_RETRY_ATTEMPTS", "1"))  # number of retries on timeout
+CLIENT_RETRY_BACKOFF_S = float(os.getenv("CLIENT_RETRY_BACKOFF_S", "0.75"))  # base backoff seconds
 URL_RUNSYNC = f"{RUNPOD_BASE}/{ENDPOINT_ID}/runsync"
 
 DEFAULT_SAMPLING = {
@@ -561,19 +564,40 @@ def extract_usage(payload: dict) -> dict | None:
     return None
 
 async def call_endpoint(prompt: str, sampling: dict) -> dict:
-    """Call RunPod endpoint with ChatML prompt."""
+    """Call RunPod endpoint with ChatML prompt (with timeout retries)."""
     payload = {
         "input": {
             "prompt": prompt,
-            "sampling_params": sampling
+            "sampling_params": sampling,
         }
     }
 
+    attempts = max(1, int(CLIENT_RETRY_ATTEMPTS) + 1)
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        r = await client.post(URL_RUNSYNC, headers=HEADERS, json=payload)
-        if r.status_code != 200:
-            raise Exception(f"Error {r.status_code}: {r.text[:300]}")
-        return r.json()
+        last_exc: Exception | None = None
+        for i in range(attempts):
+            try:
+                r = await client.post(URL_RUNSYNC, headers=HEADERS, json=payload)
+                if r.status_code != 200:
+                    raise Exception(f"Error {r.status_code}: {r.text[:300]}")
+                return r.json()
+            except httpx.TimeoutException as te:
+                last_exc = te
+                if i < attempts - 1:
+                    delay = CLIENT_RETRY_BACKOFF_S * (2 ** i)
+                    logger.debug(f"Timeout on attempt {i+1}/{attempts}. Backing off {delay:.2f}s…")
+                    await asyncio.sleep(delay)
+                    continue
+                break
+            except Exception as e:
+                # Non-timeout errors are not retried; propagate
+                last_exc = e
+                break
+
+        # Exhausted attempts
+        if last_exc:
+            raise last_exc
+        raise Exception("Unknown error: request failed without exception")
 
 async def generate_with_validation(domain: str, user_prompt: str, sampling: dict,
                                    enable_validation: bool, micro_retry: bool,
@@ -837,7 +861,15 @@ async def send_query(prompt: str, domain: str, sampling: dict, enable_validation
             slots=slots,
         )
     except Exception as e:
-        await thinking.update(content=f"❌ Request error: {e}")
+        # Chainlit Message.update() does not accept keyword args; set content then update
+        is_timeout = isinstance(e, (httpx.TimeoutException, httpx.ReadTimeout))
+        err_msg = (
+            "❌ Request timed out. Try again shortly or increase CLIENT_TIMEOUT_S / CLIENT_RETRY_ATTEMPTS."
+            if is_timeout
+            else f"❌ Request error: {e}"
+        )
+        thinking.content = err_msg
+        await thinking.update()
         return
 
     # Remove thinking message

@@ -123,8 +123,9 @@ reaction_on_message_received = false
     #    accept = ["image/*", "audio/*", "video/*"]
     # 3. For specific file extensions:
     #    accept = {{ "application/octet-stream" = [".xyz", ".pdb"] }}
-    # Note: Using "*/*" is not recommended as it may cause browser warnings
-    accept = ["*/*"]
+    # Note: Using "*/*" is not recommended as it may cause browser warnings.
+    # The default below allows broad categories without invalid wildcards.
+    accept = ["application/*", "audio/*", "image/*", "text/*", "video/*"]
     max_files = 20
     max_size_mb = 500
 

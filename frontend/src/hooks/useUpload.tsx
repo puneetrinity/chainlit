@@ -32,22 +32,31 @@ const useUpload = ({ onError, onResolved, options, spec }: useUploadProps) => {
     [spec]
   );
 
-  let dzAccept: Record<string, string[]> = {};
+  // Normalize and sanitize accept so react-dropzone doesn't warn on invalid patterns like "*/*"
+  let dzAccept: Record<string, string[]> | undefined = undefined;
   const accept = spec.accept;
 
   if (Array.isArray(accept)) {
-    accept.forEach((a) => {
-      if (typeof a === 'string') {
-        dzAccept[a] = [];
-      }
-    });
-  } else if (typeof accept === 'object') {
-    dzAccept = accept;
+    const filtered = accept.filter(
+      (a) => typeof a === 'string' && a.trim() !== '*/*'
+    );
+    if (filtered.length) {
+      dzAccept = {};
+      filtered.forEach((a) => {
+        dzAccept![a] = [];
+      });
+    }
+  } else if (accept && typeof accept === 'object') {
+    const entries = Object.entries(accept).filter(([mime]) => mime.trim() !== '*/*');
+    if (entries.length) {
+      dzAccept = Object.fromEntries(entries);
+    }
   }
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     maxFiles: spec.max_files || undefined,
+    // If accept is undefined (allow-all), omit to avoid browser/attr-accept warnings
     accept: dzAccept,
     maxSize: (spec.max_size_mb || 2) * 1000000,
     ...options
